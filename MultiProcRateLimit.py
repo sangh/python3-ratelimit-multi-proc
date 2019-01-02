@@ -120,6 +120,7 @@ class MultiProcRateLimit:
                 acc_time = acc_time + time.time() - t_start
                 if acc_time > self.wait_timeout:
                     raise
+            time.sleep(0.1)  # Really just need to yield.
 
     def __init__(self, db_filename, create_db_with_these_ratelimits):
         """See class documentation.
