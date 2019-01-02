@@ -19,7 +19,7 @@ class MultiProcRateLimit:
 
         # This is the Sqlite DB file and it needs to be the same for every
         # interpreter/process/thread that is rate limited together.
-        dbfile = "/tmp/ratelimits.sqlite",
+        dbfile = "/tmp/ratelimits.sqlite"
 
         # This is a set of rate limits (rate, per_interval) where rate
         # is an int and per_interval is a float in seconds.  This
@@ -35,156 +35,53 @@ class MultiProcRateLimit:
         # each thread can instantiate their own).
         ratelimit = MultiProcRateLimit.MultiProcRateLimit(dbfile, ratelimits)
 
-        # To rate limit the call to `myfunc(arg1, arg2)` we do:
-        ratelimit.call(myfunc, (arg1, arg2))
+        # To rate limit the call to `ret = myfunc()` we do:
+        ret = ratelimit.call(myfunc)
+
+        # To rate limit the call to `myfunc2(arg1, arg2, narg=318)` we do:
+        ratelimit.call(myfunc2, (arg1, arg2), {"narg": 318, })
+
+        # To rate limit the call to `ret = myfunc3(namedarg=somevalue)` we do:
+        ret = ratelimit.call(myfunc3, (), {"namedarg": somevalue, })
+
+    If `myfunc()` would have raised an exception, the call to
+    `ratelimit.call(myfunc)` will raise the same exception.
 
     """
-    def __init__(self, db_filename, create_db_with_these_ratelimits):
-        """See class documentation.
-        
-        This will almost never raise an exception.  You need to call the
-        `call` function to see if you get filesystem errors.
-
-        If the DB file is missing sqlite will create it.  Then we try and
-        create the tables.  If the table exists this will raise an exception
-        and the insert clause will never be executed (but that exception will
-        not be propagated back outside this function).  We could check if the
-        table exists with:
-
-        SELECT name
-            FROM sqlite_master
-            WHERE type='table'
-                AND name='table_name_to_check_if_exists'
-            COLLATE NOCASE
-
-        and then do the insert, but that didn't measure much faster on my
-        machine and there are other errors we also want to swallow.
-
-        Anyway, if anything fails then the whole of it will be rolled back.
+    def _isolate_db_query(self, query_fn, ret_lst, args, kwargs):
+        """Helper function for `isolate_db_query(...)`.
         """
-        self.db_filename = db_filename
-
-        def create_query(
-                conn,
-                format_unix_time_float_for_db,
-                create_db_with_these_ratelimits):
-
-            tnow = format_unix_time_float_for_db()
-
-            conn.execute(
-                "CREATE TABLE ratelimit_last_query_time ("
-                    "id INTEGER PRIMARY KEY CHECK (id = 0), "
-                    "unix_time_float REAL"
-                ")")
-            conn.execute(
-                "INSERT INTO ratelimit_last_query_time "
-                    "(id, unix_time_float) "
-                    "VALUES (0, %s)" % tnow
-                )
-            conn.execute(
-                "CREATE TABLE ratelimit_ratelimits ("
-                    "id INTEGER PRIMARY KEY, "
-                    "allowed_times_int INTEGER, "
-                    "per_seconds_float REAL, "
-                    "count_int INTEGER, "
-                    "since_float REAL"
-                ")")
-            idx = 0
-            for rl in create_db_with_these_ratelimits:
-                conn.execute(
-                    "INSERT INTO ratelimit_ratelimits "
-                        "(id, allowed_times_int, per_seconds_float, "
-                        "count_int, since_float) "
-                        "VALUES (%d, %d, %f, 0, %s)" % (idx, rl[0], rl[1], tnow)
-                    )
-                idx = idx + 1
-
+        conn = sqlite3.connect(
+                self.db_filename,
+                isolation_level=None,
+                timeout=self.transaction_timeout)
         try:
-            self.isolate_db_query(create_query, (
-                format_unix_time_float_for_db,
-                create_db_with_these_ratelimits))
-        except Exception as exp:
-            pass
+            conn.execute("PRAGMA locking_mode=EXCLUSIVE;").close()
+            conn.execute("BEGIN EXCLUSIVE;").close()
 
+            # This fn can call things like: ret = conn.execute(qs).fetchall()
+            # Remember that all cursors need to be closed!
+            query_fn(conn, ret_lst, *args, **kwargs)
 
-    def call(self, query_fn, query_fn_args):
-        """Main function that should be called to ratelimit the given
-        `query_fn`.  This queries and sets the last query time and then waits
-        (by sleeping) for the ratelimits to allow the call.
-        
-        This function returns whatever `query_fn(*query_fn_args)` returns.
-        """
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-        def wait_call_query_fn(
-                conn,
-                format_unix_time_float_for_db,
-                query_fn,
-                query_fn_args):
-
-            last_query_time = conn.execute(
-                "SELECT unix_time_float "
-                    "FROM ratelimit_last_query_time "
-                    "WHERE id = 0"
-                ).fetchall()[0][0]
-
-            ratelimits = conn.execute(
-                "SELECT id, allowed_times_int, per_seconds_float, "
-                    "count_int, since_float "
-                    "FROM ratelimit_ratelimits"
-                ).fetchall()
-
-            rl_ids_to_update = []
-            for ratelimit in ratelimits:
-                rl_id, allowed_times_int, per_seconds_float, \
-                        count_int, since_float = ratelimit
-
-                if count_int < allowed_times_int:
-                    conn.execute(
-                        "UPDATE ratelimit_ratelimits SET count_int = "
-                        "%d WHERE id = %d" % (count_int + 1, rl_id)
-                        )
-                else:
-                    rl_ids_to_update.append(rl_id)
-                    # Cap sleep time to `per_seconds_float` in case the user
-                    # changed the OS clock way forward to avoid waiting however
-                    # long that is because the max we should ever wait to be
-                    # within the raet limit is `per_seconds_float`.
-                    wait_time = \
-                            last_query_time + per_seconds_float - time.time()
-                    if wait_time > 0:
-                        if wait_time > per_seconds_float:
-                            wait_time = per_seconds_float
-                        time.sleep(wait_time)
-
-            ret = query_fn(*query_fn_args)
-
-            tfinished = format_unix_time_float_for_db()
-
-            conn.execute(
-                "UPDATE ratelimit_last_query_time "
-                    "SET unix_time_float = %s WHERE id = 0" % tfinished
-                )
-            conn.execute(
-                "UPDATE ratelimit_ratelimits SET count_int = 1, since_float = "
-                    "%s WHERE id IN (%s)" % (
-                        tfinished,
-                        ", ".join(map(lambda x: str(x), rl_ids_to_update))
-                    )
-                )
-
-            return ret
-
-        return self.isolate_db_query(
-                wait_call_query_fn,
-                (self.format_unix_time_float_for_db, query_fn, query_fn_args))
-
-
-    def isolate_db_query(self, callback, callback_extra_args):
-        """Run `callback(conn, *callback_extra_args)` within an exclusive
+    def isolate_db_query(self, query_fn, args=(), kwargs={}):
+        """Run `query_fn(conn, ret_lst, *args, **kwargrs)` within an exclusive
         lock on the connected Sqlite DB (accessed via `conn`).
-        
+
         See the `README.md` file for some usage examples.
-        
+
         Ridiculously the sqlite module doesn't do locking by default even
         though the docs kinda imply that `with conn...` is enough to do so.
         Instead you have to say the magic words AND you have to make sure you
@@ -193,45 +90,182 @@ class MultiProcRateLimit:
         So this function takes a function that takes the connection where
         whatever happens in the function is isolated.
 
-        The callback doesn't need to (and should not) call commit, callback, or
-        close.  If the callback returns cleanly then `commit()` is called, if
-        it raises an exception then `rollback()` is called and the same
-        exception is re-raised from this function.  In every case the
-        connection is closed before returning (via the finally clause).
+        The query_fn *should not* call commit, callback, or close.  If the
+        query_fn returns cleanly then `commit()` is called, if it raises an
+        exception then `rollback()` is called and the same exception is
+        re-raised from this function.  In every case the connection is closed
+        before returning (via the finally clause).
+
+        The query_fn should also not return anything (anything returned will
+        be ignored), instead, if it wants it can appended one value to ret_lst.
+        We do this b/c the function or the sqlite statements could throw and
+        if sqlite throws after the function is called we do not want to call
+        the function again.  This allows query_fn to have sqlite calls both
+        before and after anything else it wants to do.
+
+        That means that query_fn should _check_ if there are any values in
+        ret_lst and not do the non-DB stuff if so.
+        """
+        acc_time = 0.0
+        while True:
+            t_start = time.time()
+            try:
+                ret = []
+                self._isolate_db_query(query_fn, ret, args, kwargs)
+                if ret:
+                    return ret[0]
+                else:
+                    return
+            except sqlite3.OperationalError:
+                acc_time = acc_time + time.time() - t_start
+                if acc_time > self.wait_timeout:
+                    raise
+
+    def __init__(self, db_filename, create_db_with_these_ratelimits):
+        """See class documentation.
+
+        If the DB file is missing sqlite will create it (or this function will
+        raise an exception).  Then, if the table is not found using:
+
+            SELECT name
+                FROM sqlite_master
+                WHERE type='table'
+                    AND name='multi_proc_rate_limit'
+                COLLATE NOCASE
+
+        We will try to create and fill it.
+        """
+        if not isinstance(db_filename, str) and \
+                not isinstance(db_filename, bytes):
+            raise Exception("Argument db_filename is not a str or bytes.")
+
+        for rl in create_db_with_these_ratelimits:
+            if not isinstance(rl[0], int) or rl[0] <= 0:
+                raise Exception("Rate must be an int greater than 0.")
+            if not isinstance(rl[1], float) or rl[1] <= 0.0:
+                raise Exception("Per_interval must be > 0.0 and a float.")
+
+        self.db_filename = db_filename
+
+        # This could be an argument, but since it is an int it must be less
+        # than or equal to 2147483647 and greater than or equal to 0.
+        # It is set to 2.5 hours, which may be longer than you want to
+        # wait before this (or call or isolate) returns a:
+
+        #   sqlite3.OperationalError: database is locked
+
+        # Assuming, of course, that you have so many waiting requests (relative
+        # to your ratelimits) that it takes that long to process them.
+        self.wait_timeout = 9000.0  # 9k seconds is two and a half hours.
+        self.transaction_timeout = 1  # Second.
+
+        def mktable(conn, ret_lst, create_db_with_these_ratelimits):
+
+            t_mktables_start = time.time()
+
+            cur = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND "
+                        "name='multi_proc_rate_limit' COLLATE NOCASE;"
+                    )
+            try:
+                if cur.fetchall():
+                    return
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
+            conn.execute(
+                "CREATE TABLE multi_proc_rate_limit ("
+                    "id INTEGER PRIMARY KEY, "
+                    "allowed_times_int INTEGER, "
+                    "per_seconds_float REAL, "
+                    "count_int INTEGER, "
+                    "since_float REAL"
+                ");").close()
+
+            for idx, (allowed_times, per_secs) in enumerate(
+                    create_db_with_these_ratelimits):
+                # We want to set all the since_float times to long enough ago
+                # that every interval, on the first call, gets reset to a count
+                # of 1.  So we set it to longer than the interval (per second)
+                # seconds ago and the count to maximum.
+                conn.execute(
+                    "INSERT INTO multi_proc_rate_limit "
+                            "(id, "
+                            "allowed_times_int, per_seconds_float, "
+                            "count_int, since_float) "
+                        "VALUES (%r, %r, %r, %r, %r);" %
+                            (idx,
+                            allowed_times, per_secs,
+                            allowed_times, t_mktables_start - per_secs)
+                    ).close()
+            # End mktable.
+
+        # Run create_query before returning from __init__.  This may raise.
+        return self.isolate_db_query(
+                mktable,
+                args=(create_db_with_these_ratelimits, ))
+
+
+    def call(self, query_fn, args=(), kwargs={}):
+        """Main function that should be called to ratelimit the given
+        `query_fn`.  This queries and sets the last query time and then waits
+        (by sleeping) for the ratelimits to allow the call.
         
-        The timeout is set to 25 hours, which may be longer than you want to
-        wait before this returns a `sqlite3.OperationalError: database is
-        locked`, assuming, of course, that you have so many waiting requests
-        that the API takes that long to process them."""
+        This function returns whatever `query_fn(*args, **kwargs)` returns.
+        """
 
-        conn = sqlite3.connect(self.db_filename, 9000.0, 0, "EXCLUSIVE")
-        try:
-            conn.execute("BEGIN EXCLUSIVE")
+        def wait_call(conn, ret_lst, query_fn, args, kwargs):
 
-            # This fn can call things like: ret = conn.execute(qs).fetchall()
-            ret = callback(conn, *callback_extra_args)
+            time_called = time.time()
 
-            conn.commit()
-            return ret
-        except Exception as exp:
-            try:
-                conn.rollback()
-            except Exception as exp:
-                pass
-            raise
-        finally:
-            try:
-                conn.close()
-            except Exception as exp:
-                pass
+            cur = conn.execute(
+                "SELECT id, allowed_times_int, per_seconds_float, "
+                    "count_int, since_float "
+                    "FROM multi_proc_rate_limit;"
+                )
+            ratelimits = cur.fetchall()
+            cur.close()
+
+            wait_time = 0.0
+            ids_to_reset = []
+            for rl_id, allowed_times, per_secs, cnt, t_since in ratelimits:
+
+                if cnt < allowed_times:
+                    conn.execute(
+                        "UPDATE multi_proc_rate_limit SET count_int = "
+                        "%r WHERE id = %r;" % (cnt + 1, rl_id)
+                        ).close()
+
+                else:
+                    ids_to_reset.append(rl_id)
+                    # Cap sleep time to `per_secs` in case the user changed the
+                    # OS clock way forward to avoid waiting however long that
+                    # is because the max we should ever wait to be within the
+                    # rate limit is `per_secs`.
+                    new_wait_time = t_since + per_secs - time_called
+                    if new_wait_time > per_secs:
+                        new_wait_time = per_secs
+                    wait_time = max(wait_time, new_wait_time)
 
 
-    def format_unix_time_float_for_db(self):
-        """We want to store the time (the float of unix-ish time returned by
-        `time.time()`) with the maximum precision that is storable by the
-        internal float representation.  There is no easy way to get this
-        number, though in many cases Python prints out that representation by
-        default so instead we use the max number of digits that Python
-        guarantees that a string is convertible to a float and vice-versa with
-        no loss of precision."""
-        return "%%.%if" % sys.float_info.dig % time.time()
+            time.sleep(wait_time)
+
+            if not ret_lst:
+                ret_lst.append(query_fn(*args, **kwargs))
+
+            conn.execute(
+                "UPDATE multi_proc_rate_limit SET count_int = 1, since_float"
+                    " = %r WHERE id IN (%s);" % (
+                        time.time(),
+                        ", ".join(map(lambda x: str(x), ids_to_reset))
+                    )
+                ).close()
+
+            return
+
+        # And call it.
+        return self.isolate_db_query(wait_call, (query_fn, args, kwargs))
+

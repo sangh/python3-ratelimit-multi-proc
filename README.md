@@ -134,8 +134,6 @@ with this library you can just pass in any function you want.
 
 ## Usage and Examples
 
-### Basic Usage
-
     import MultiProcRateLimit
 
 This is the Sqlite DB file and it needs to be the same for every
@@ -166,36 +164,57 @@ raise an exception if something doesn't work.
 
     ratelimit = MultiProcRateLimit.MultiProcRateLimit(dbfile, ratelimits)
 
-To rate limit the call to `myfunc(arg1, arg2)` we do:
+To rate limit the call to `ret = myfunc(arg1, arg2, namedarg=val)` we do:
 
-    ratelimit.call(myfunc, (arg1, arg2))
+    ret = ratelimit.call(myfunc, (arg1, arg2), {'namedarg': val})
+
+But `args` default to `()` and `kwargs` default to `{}`, so with no args:
+
+    ratelimit.call(myfuncthattakesnoarguments)
+
+And if you the function `myfunconlynamedargs` only takes named arguments,
+then you have to one of the following:
+
+    ratelimit.call(myfunconlynamedargs, (), {'namedarg': val, })
+
+or
+
+    ratelimit.call(myfunconlynamedargs, kwargs={'namedarg': val, })
+
+If `myfunc` would have raised an exception then the call to `ratelimit.call`
+will raise the same exception.
 
 Additionally there is a function to directly query the DB (the Sqlite DB file),
 which can be called to allow the program to store a little bit of data:
 
-    def db_create_table_fn(conn):
+    def db_create_table_fn(conn, ret_lst):
         conn.execute(
             "CREATE TABLE my_table ("
                 "id INTEGER PRIMARY KEY, "
                 "some_numbers REAL)"
-            )
+            ).close()
 
-    def db_store_number(conn, id_int, n_float):
+    def db_store_number(conn, ret_lst, id_int, n_float):
         conn.execute(
             "INSERT INTO my_table (id, some_numbers) "
                 "VALUES (%d, %f)" % (id_int, n_float)
-            )
+            ).close()
 
-    def db_get_all_numbers(conn):
-        return conn.execute("SELECT id, some_numbers FROM my_table").fetchall()
+    def db_get_all_numbers(conn, ret_lst):
+        if not ret_lst:
+            try:
+                cur = conn.execute("SELECT id, some_numbers FROM my_table")
+                ret_lst.append(cur.fetchall())
+            finally:
+                cur.close()
 
-    ratelimit.isolate_db_query(db_create_table_fn, ())
+    ratelimit.isolate_db_query(db_create_table_fn)
 
     ratelimit.isolate_db_query(db_store_number, (0, 2.2))
     ratelimit.isolate_db_query(db_store_number, (1, -52342.038))
     ratelimit.isolate_db_query(db_store_number, (2, 0.0))
 
-    nums = ratelimit.isolate_db_query(db_get_all_numbers, ())
+    nums = ratelimit.isolate_db_query(db_get_all_numbers)
     for n in nums:
         print(n)
 
@@ -211,3 +230,12 @@ that need to be rate limited.  This DB access function is just here because it
 is easy to include and is useful for many scripts that just want to share a
 tiny bit of data between threads or processes and don't want to do their own
 concurrency checks (locks and semaphores, etc.).
+
+Also remember that you want to close all cursors you use in the function
+passed into `isolate_db_query`, but you DO NOT want to commit, rollback, or
+close the _connection_.
+
+And anything you return will be lost, instead append one item to `ret_lst`,
+and if when the sqlite stuff raises an exception you don't want one non-DB
+stuff run again check the value of the passed in `ret_lst` to see if you want
+to run that stuff again.
