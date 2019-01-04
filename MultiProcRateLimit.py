@@ -120,7 +120,7 @@ class MultiProcRateLimit:
                 acc_time = acc_time + time.time() - t_start
                 if acc_time > self.wait_timeout:
                     raise
-            time.sleep(0.1)  # Really just need to yield.
+            time.sleep(sys.float_info.epsilon)  # Really just need to yield.
 
     def __init__(self, db_filename, create_db_with_these_ratelimits):
         """See class documentation.
@@ -234,12 +234,11 @@ class MultiProcRateLimit:
             ids_to_reset = []
             for rl_id, allowed_times, per_secs, cnt, t_since in ratelimits:
 
-                if cnt < allowed_times:
+                if cnt < allowed_times and time_called < t_since + per_secs:
                     conn.execute(
                         "UPDATE multi_proc_rate_limit SET count_int = "
                         "%r WHERE id = %r;" % (cnt + 1, rl_id)
                         ).close()
-
                 else:
                     ids_to_reset.append(rl_id)
                     # Cap sleep time to `per_secs` in case the user changed the
@@ -250,7 +249,6 @@ class MultiProcRateLimit:
                     if new_wait_time > per_secs:
                         new_wait_time = per_secs
                     wait_time = max(wait_time, new_wait_time)
-
 
             time.sleep(wait_time)
 
