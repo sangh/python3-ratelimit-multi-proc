@@ -239,3 +239,10 @@ And anything you return will be lost, instead append one item to `ret_lst`,
 and if when the sqlite stuff raises an exception you don't want one non-DB
 stuff run again check the value of the passed in `ret_lst` to see if you want
 to run that stuff again.
+
+Also, if you need to (because for whatever reason it's too difficult to
+rewrite the call site of the function (or code block) you want to ratelimit)
+you can call `call` with a blank function right before the code.  Like this:
+
+    ratelimit.call(lambda: None)
+    another_function()  # ... Or other code.
