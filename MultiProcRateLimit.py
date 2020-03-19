@@ -140,6 +140,17 @@ class MultiProcRateLimit:
                 not isinstance(db_filename, bytes):
             raise Exception("Argument db_filename is not a str or bytes.")
 
+        # We try and open the DB right here in init.  This shouldn't block
+        # ever if the connection works because we are not going call the
+        # pragma for exclusive access, but this will fail (raising an
+        # an exception if the file cann't be opened.  If we didn't check this
+        # here then the client would have to wait for the self_wait timeout,
+        # which is long, before getting an error back.  It is annoying that
+        # sqlite returns the same Exception for permission denied (where
+        # trying again is futile) and DB is locked (where we want to wait and
+        # try again, maybe for a very long time).
+        sqlite3.connect(db_filename, isolation_level=None, timeout=.01).close()
+
         for rl in create_db_with_these_ratelimits:
             if not isinstance(rl[0], int) or rl[0] <= 0:
                 raise Exception("Rate must be an int greater than 0.")
